@@ -1,0 +1,87 @@
+# Qwen-Image-2.1 的 Diffusers 后端。
+#
+# 为什么是 Diffusers 而不是 SGLang（原计划的首选）：
+#   sglang 的 Qwen-Image-2.1 支持 commit（f9c2791）硬性依赖 cuda-python>=13.0，
+#   而 cuda-python>=13 要求 cuda-bindings>=13，torch 2.13.0+cu129 又要求
+#   cuda-bindings<13 —— 二者互斥。唯一出路是 cu130，即驱动 >=580；
+#   本机驱动 570.86.15（CUDA 12.8），升级需重启且会杀掉 15 个在跑的容器。
+#
+#   diffusers 这条路的依赖干净得多：只要 torch>=2.6 + transformers，
+#   完全没有 cuda-python。torch 用 cu128 构建，与本机驱动精确匹配。
+#
+# 基座复用本机已缓存的 nvidia/cuda:12.8.1 —— 无需再走那台不稳的镜像源。
+FROM nvidia/cuda:12.8.1-cudnn-devel-ubuntu22.04
+
+ARG HTTP_PROXY=""
+ARG HTTPS_PROXY=""
+ARG NO_PROXY="localhost,127.0.0.1,::1"
+ENV http_proxy=${HTTP_PROXY} \
+    https_proxy=${HTTPS_PROXY} \
+    no_proxy=${NO_PROXY} \
+    DEBIAN_FRONTEND=noninteractive
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      curl git ca-certificates build-essential pkg-config \
+      libgl1 libglib2.0-0 ffmpeg \
+ && rm -rf /var/lib/apt/lists/*
+
+RUN curl -LsSf https://astral.sh/uv/install.sh | sh
+ENV PATH=/root/.local/bin:$PATH
+
+# 基座是 Ubuntu 22.04，自带 python3.10 —— 不够，diffusers main 要 3.11+
+RUN uv python install 3.12
+RUN uv venv --python 3.12 --seed /opt/venv
+ENV VIRTUAL_ENV=/opt/venv \
+    PATH=/opt/venv/bin:$PATH
+
+ARG TORCH_INDEX=https://download.pytorch.org/whl/cu128
+
+# torch 走 cu128 索引且**不指定版本**，让 uv 取该索引下最新的 cu128 构建。
+# 不写死版本是有意的：写死了容易和 diffusers main / transformers 的要求打架，
+# 而只要索引限定在 cu128，就不会意外拿到需要驱动 580 的 cu130 构建。
+RUN set -eux; \
+    uv pip install --index-url "${TORCH_INDEX}" torch torchvision; \
+    python -c "import torch; print('torch', torch.__version__); print('built for CUDA', torch.version.cuda)"; \
+    python -c "import torch,pathlib; pathlib.Path('/tmp/constraints.txt').write_text(f'torch=={torch.__version__}\ntorchvision=={__import__(\"torchvision\").__version__}\n')"; \
+    cat /tmp/constraints.txt
+
+# 其余依赖走 PyPI。约束文件把 torch/torchvision 钉死在刚装的 cu128 版本上，
+# 防止解析过程中被换成 PyPI 上同号的 cu13x 构建。
+# transformers>=5.17 是 Qwen-Image-2.1 的硬性要求（Qwen3-VL 文本编码器）。
+RUN set -eux; \
+    uv pip install --prerelease=allow \
+        --index-strategy unsafe-best-match \
+        --extra-index-url "${TORCH_INDEX}" \
+        --constraint /tmp/constraints.txt \
+        "transformers>=5.17" accelerate safetensors pillow \
+        fastapi "uvicorn[standard]" python-multipart; \
+    uv pip install --prerelease=allow \
+        --index-strategy unsafe-best-match \
+        --extra-index-url "${TORCH_INDEX}" \
+        --constraint /tmp/constraints.txt \
+        "diffusers @ git+https://github.com/huggingface/diffusers"; \
+    python -c "import torch, transformers, diffusers; \
+print('torch', torch.__version__); \
+print('transformers', transformers.__version__); \
+print('diffusers', diffusers.__version__)"
+
+# diffusers 的 PyPI 最新版是 0.40.0，还没有 QwenImage21Pipeline
+# （该 pipeline 于 2026-09-18 合入 main，尚未发版）。这里断言它真的在，
+# 免得构建出一个"装上了但跑不了"的镜像。
+RUN python -c "\
+from diffusers import QwenImage21Pipeline; \
+print('QwenImage21Pipeline OK:', QwenImage21Pipeline.__module__)"
+
+COPY server.py /app/server.py
+WORKDIR /app
+
+ENV MODEL_PATH=/models/Qwen-Image-2.1 \
+    MODEL_ID=Qwen/Qwen-Image-2.1 \
+    TORCH_DTYPE=bfloat16 \
+    PORT=8091
+
+EXPOSE 8091
+HEALTHCHECK --interval=30s --timeout=10s --start-period=900s --retries=5 \
+  CMD python -c "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8091/healthz',timeout=8).status==200 else 1)"
+
+CMD ["python", "server.py"]

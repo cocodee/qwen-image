@@ -1,0 +1,103 @@
+name: qwen-image
+
+# 说明：本机 docker daemon **不走代理**（systemd 服务不继承 shell 的 http_proxy），
+# 直连 Docker Hub / 国内镜像源都不稳定。所以构建时统一带 --network host +
+# 代理参数，让容器内的 apt/pip/uv 走宿主机那条已验证好用的代理。
+# 见 Makefile 的 up / build 目标。
+
+services:
+  # ------------------------------------------------------------------
+  # 推理后端：diffusers 跑 Qwen-Image-2.1，只对内暴露给 gateway
+  # ------------------------------------------------------------------
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile.diffusers
+      # 必须 host 网络：否则容器内到不了宿主机的代理 127.0.0.1:7890，
+      # apt/pip 会走直连，而本机对境外源的直连很不稳。
+      network: host
+      args:
+        HTTP_PROXY: ${BUILD_HTTP_PROXY:-http://127.0.0.1:7890}
+        HTTPS_PROXY: ${BUILD_HTTPS_PROXY:-http://127.0.0.1:7890}
+    image: qwen-image-backend:local
+    environment:
+      - MODEL_PATH=/models/Qwen-Image-2.1
+      - MODEL_ID=${MODEL_ID:-Qwen/Qwen-Image-2.1}
+      - TORCH_DTYPE=${TORCH_DTYPE:-bfloat16}
+      # 显存不够时置 1，把 pipeline 卸载到 CPU 分步执行（明显变慢但能跑起来）
+      - CPU_OFFLOAD=${CPU_OFFLOAD:-0}
+      - DEFAULT_RESOLUTION=${DEFAULT_RESOLUTION:-1024}
+    volumes:
+      # 权重只读挂载。33GB 已在宿主机就位，容器无需再下载。
+      - ./models/huggingface/Qwen-Image-2.1:/models/Qwen-Image-2.1:ro
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              # GPU_ID 由 `make up` 自动选卡填充（默认是 GPU UUID）；也可
+              # `make up GPU_ID=3` 或 `make up GPU_ID=GPU-xxxxxxxx-...` 显式指定。
+              # 默认用 UUID 而非 index 是有原因的：docker 的 device_ids 里
+              # index 走的是 nvidia-container-runtime 自己的枚举顺序，与
+              # nvidia-smi 的 index 不保证一致（实测声明 "1" 会落到 2 号卡）。
+              device_ids: ["${GPU_ID:?未设置 GPU_ID —— 请通过 make up 启动，或显式传 GPU_ID=<uuid|index>}"]
+              capabilities: [gpu]
+    shm_size: 16g
+    ipc: host
+    # 加载 33GB 权重 + 首次 CUDA 图捕获要几分钟，start_period 给足
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8091/healthz',timeout=8).status==200 else 1)\""]
+      interval: 30s
+      timeout: 10s
+      start_period: 900s
+      retries: 5
+    # 崩溃循环会反复抢显存，失败 3 次就停手，让人来看日志
+    restart: "on-failure:3"
+
+  # ------------------------------------------------------------------
+  # 网关：OpenAI 兼容 + 异步任务层。纯 CPU。
+  # ------------------------------------------------------------------
+  gateway:
+    build:
+      context: ./gateway
+    image: qwen-image-gateway:local
+    # 必须与宿主机 ./data 的属主 uid 一致，否则容器内写 /app/data 会 Permission denied
+    # （镜像里的 gateway 用户是 uid 10001，宿主机 kdi 是 1001）。
+    # 换台机器部署时用 `id -u` / `id -g` 查出来改这里。
+    user: "${DATA_UID:-1001}:${DATA_GID:-1001}"
+    environment:
+      - BACKEND_BASE_URL=http://backend:8091
+      - MODEL_ID=${MODEL_ID:-Qwen/Qwen-Image-2.1}
+      # diffusers 没有批处理引擎，并发只会互抢显存 —— 默认串行。
+      # 若改用 SGLang 后端可调高。
+      - MAX_CONCURRENCY=${MAX_CONCURRENCY:-1}
+      - MAX_QUEUE_DEPTH=${MAX_QUEUE_DEPTH:-32}
+      - TASK_TTL_HOURS=${TASK_TTL_HOURS:-24}
+      - REQUEST_TIMEOUT_S=${REQUEST_TIMEOUT_S:-600}
+      - PUBLIC_BASE_URL=${PUBLIC_BASE_URL:-http://localhost:8090}
+      - EDIT_IMAGE_FIELD=${EDIT_IMAGE_FIELD:-image}
+      - DATA_DIR=/app/data
+    volumes:
+      - ./data:/app/data
+    depends_on:
+      backend:
+        # 不等健康检查 —— 后端要几分钟才 ready，gateway 先起来
+        # 并把 /healthz 报成 degraded，比让整个栈卡住更有用
+        condition: service_started
+    restart: unless-stopped
+
+  # ------------------------------------------------------------------
+  # Web 前端：静态单页 + 反向代理。全栈唯一对外端口。
+  # ------------------------------------------------------------------
+  web:
+    build:
+      context: ./web
+    image: qwen-image-web:local
+    ports:
+      - "0.0.0.0:8090:80"
+    depends_on:
+      gateway:
+        # 同 gateway 对 backend 的策略：不等健康检查，先起来。
+        # 网关没就绪时页面能加载，只是 API 报错，比整个栈卡住更有用。
+        condition: service_started
+    restart: unless-stopped

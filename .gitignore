@@ -1,0 +1,15 @@
+# 运行时数据与产物
+data/
+models/
+.env
+
+# Python
+__pycache__/
+*.py[cod]
+.ruff_cache/
+.pytest_cache/
+*.egg-info/
+
+# 编辑器
+.idea/
+.vscode/
